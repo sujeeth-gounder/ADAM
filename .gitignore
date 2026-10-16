@@ -1,0 +1,54 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dll
+*.dylib
+
+# C extensions
+*.obj
+*.o
+*.a
+*.lib
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Distribution / Binaries / Portable builds
+dist/
+build/
+ADAM_PORTABLE/dist/
+*.egg-info/
+.eggs/
+
+# Backups
+backups/
+*.bak
+
+# Temporary and Log files
+*.log
+/tmp/
+.cache/
+
+# Large AI Model weights (downloaded via scripts/download_models.py)
+models/piper/*.onnx
+ADAM_PORTABLE/models/piper/*.onnx
+
+# 3D Exports & generated audio/media
+exports/*.stl
+exports/*.obj
+ADAM_PORTABLE/exports/*.stl
+ADAM_PORTABLE/exports/*.obj
+data/audio/*.wav
+data/audio/*.mp3
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

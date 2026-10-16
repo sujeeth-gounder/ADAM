@@ -1,0 +1,16 @@
+# Core AI & LLM
+ollama>=0.3.0
+requests>=2.31.0
+
+# Speech Recognition & Audio
+SpeechRecognition>=3.10.4
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.24.0
+
+# Piper TTS (Neural Fast TTS)
+piper-tts>=1.2.0
+
+# Fallback TTS & Utilities
+pyttsx3>=2.90
+psutil>=5.9.0

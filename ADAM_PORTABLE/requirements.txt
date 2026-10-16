@@ -1,0 +1,16 @@
+# Core AI & Local LLM
+ollama>=0.3.0
+requests>=2.31.0
+
+# Audio Capture & Speech Recognition
+SpeechRecognition>=3.10.4
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.24.0
+
+# Piper Neural TTS (Fast local text-to-speech)
+piper-tts>=1.2.0
+
+# Cross-Platform Fallbacks & Diagnostics
+pyttsx3>=2.90
+psutil>=5.9.0

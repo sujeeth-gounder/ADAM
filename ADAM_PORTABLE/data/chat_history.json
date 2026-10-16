@@ -1,0 +1,17 @@
+[
+  {
+    "sender": "ADAM",
+    "text": "**Greetings! I am ADAM (Advanced Desktop AI Mate \u2014 Portable Edition).**\n\n\u2022 **Environment**: Running natively on **Fedora Linux (7.2.10-200.fc44.x86_64)**.\n\u2022 **Audio Setup**: Microphone active: `Default` (Wake word: **\"Hii\"**).\n\u2022 **Voice Engine**: Piper Neural TTS with **Amy English Voice**.\n\u2022 **Local LLM**: Powered by Ollama (`qwen2.5:1.5b`).\n\u2022 **3D Lab**: Blender 5.2.2 detected (`/usr/bin/blender`).\n\u2022 **Portability**: All data stored locally in `data/` for USB migration.\n\nTry asking questions, saying *'Hii'*, testing *'\ud83c\udf99\ufe0f Audio Setup'*, or commanding: `create 3d scifi_drone`.",
+    "timestamp": 1792074355.3556798
+  },
+  {
+    "sender": "USER",
+    "text": "helooo",
+    "timestamp": 1792074371.3453343
+  },
+  {
+    "sender": "ADAM",
+    "text": "\n[LLM Notice: Inference issue with qwen2.5:1.5b: HTTP Error 500: Internal Server Error]",
+    "timestamp": 1792074371.420453
+  }
+]

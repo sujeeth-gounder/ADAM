@@ -1,0 +1,37 @@
+{
+  "version": "1.0.0",
+  "ollama": {
+    "host": "http://localhost:11434",
+    "default_model": "qwen2.5:1.5b",
+    "recommended_models": [
+      "qwen2.5:1.5b",
+      "llama3.2:1b",
+      "llama3.2:3b",
+      "qwen2.5:3b",
+      "phi3:mini"
+    ]
+  },
+  "audio": {
+    "microphone_device_index": null,
+    "microphone_device_name": null,
+    "wake_word": "hii",
+    "wake_aliases": ["hii", "hi", "hey adam", "hi adam", "adam", "hello adam"],
+    "piper_model_name": "en_US-amy-medium",
+    "volume": 1.0,
+    "speech_rate": 1.0
+  },
+  "blender": {
+    "custom_executable_path": null,
+    "prefer_headless": true
+  },
+  "storage": {
+    "data_dir": "data",
+    "exports_dir": "data/exports",
+    "models_dir": "models/piper"
+  },
+  "ui": {
+    "theme": "cyber_dark",
+    "window_width": 1120,
+    "window_height": 800
+  }
+}
