@@ -4,9 +4,11 @@ requests>=2.31.0
 
 # Speech Recognition & Audio
 SpeechRecognition>=3.10.4
+PyAudio>=0.2.14
 sounddevice>=0.4.6
 soundfile>=0.12.1
 numpy>=1.24.0
+faster-whisper>=1.1.0
 
 # Piper TTS (Neural Fast TTS)
 piper-tts>=1.2.0
@@ -14,3 +16,4 @@ piper-tts>=1.2.0
 # Fallback TTS & Utilities
 pyttsx3>=2.90
 psutil>=5.9.0
+keyring>=25.0.0

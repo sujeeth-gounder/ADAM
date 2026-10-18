@@ -38,8 +38,23 @@ RECOMMENDED_MODELS = [
 ]
 
 # Wake Word Settings
-PRIMARY_WAKE_WORD = "hii"
-WAKE_WORDS = ["hii", "hi", "hey adam", "hi adam", "adam", "hello adam"]
+PRIMARY_WAKE_WORD = "hi adam"
+DEFAULT_WAKE_WORDS = [
+    "hey adam",
+    "drake",
+    "hi",
+    "oi",
+    "hi adam",
+    "hey",
+    "hello adam",
+    "hey assistant",
+    "wake up adam",
+    "hii",
+    "adam",
+]
+WAKE_WORDS = list(DEFAULT_WAKE_WORDS)
+DEFAULT_WAKE_TIMEOUT_SEC = 10.0
+DEFAULT_WAKE_COOLDOWN_SEC = 1.5
 
 # UI Design Tokens — Cyber Dark Glassmorphism Theme
 THEME = {
@@ -77,7 +92,10 @@ THEME = {
 }
 
 # Persona System Prompt
-ADAM_SYSTEM_PROMPT = """You are ADAM (Advanced Desktop AI Mate), a futuristic, direct, and capable local AI assistant running on Fedora Linux.
+import platform
+
+_CURRENT_OS = platform.system()
+ADAM_SYSTEM_PROMPT = f"""You are ADAM (Advanced Desktop AI Mate), a futuristic, direct, and capable local AI assistant running on {_CURRENT_OS}.
 Your persona is polite, concise, intelligent, and focused on helping the user navigate their computer, manage tasks, explore ideas, and generate content.
 
 Guidelines:
@@ -85,4 +103,6 @@ Guidelines:
 2. If the user asks you to open a site, application, or perform a system task, indicate clearly what you are doing.
 3. Be respectful of safety. Destructive file operations or terminations will trigger explicit confirmation prompts.
 4. If you do not know something or a local service is unavailable, inform the user honestly without fabricating data.
+5. Always respond in concise English, regardless of the language or script in a song title or search query.
+6. Identity awareness: Your name is ADAM. The user is a separate person with their own name and preferences. Never state that your name is the user's name.
 """

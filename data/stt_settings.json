@@ -1,0 +1,23 @@
+{
+  "stt_engine": "faster_whisper",
+  "whisper_model": "base",
+  "language": "en",
+  "wake_words": [
+    "hey adam",
+    "drake",
+    "hi",
+    "oi",
+    "hi adam",
+    "hey",
+    "hello adam",
+    "hey assistant",
+    "wake up adam",
+    "hii",
+    "adam"
+  ],
+  "wake_timeout_sec": 10.0,
+  "wake_cooldown_sec": 1.5,
+  "min_energy_threshold": 280,
+  "clap_activation_enabled": false,
+  "clap_sensitivity": 0.7
+}

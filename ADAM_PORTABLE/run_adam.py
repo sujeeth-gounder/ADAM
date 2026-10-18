@@ -21,8 +21,10 @@ def ensure_venv_execution():
     if in_venv:
         return
 
-    # Check for local venv
+    # Check for local venv or root workspace venv
     venv_dir = ROOT_DIR / "venv"
+    if not venv_dir.exists():
+        venv_dir = ROOT_DIR.parent / "venv"
     if not venv_dir.exists():
         return
 
@@ -35,8 +37,13 @@ def ensure_venv_execution():
     if venv_python.exists() and str(venv_python) != sys.executable:
         print(f"[LAUNCHER] Activating local virtualenv: {venv_python}")
         cmd = [str(venv_python), str(Path(__file__).resolve())] + sys.argv[1:]
+        env = dict(os.environ)
+        user_site = Path.home() / ".local" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+        if user_site.exists():
+            existing_pp = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{user_site}{os.pathsep}{existing_pp}" if existing_pp else str(user_site)
         try:
-            sys.exit(subprocess.call(cmd))
+            sys.exit(subprocess.call(cmd, env=env))
         except Exception as e:
             print(f"[LAUNCHER] Notice: Could not re-exec into venv ({e}), continuing with {sys.executable}")
 
@@ -75,6 +82,15 @@ def main():
 
     ensure_venv_execution()
     check_and_start_ollama()
+
+    # Inject user site packages for Fedora (e.g. Faster-Whisper)
+    candidates = [
+        Path.home() / ".local" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages",
+        Path.home() / ".local" / "lib" / f"python3.{sys.version_info.minor}" / "site-packages",
+    ]
+    for c in candidates:
+        if c.exists() and str(c) not in sys.path:
+            sys.path.insert(0, str(c))
 
     # Import and launch GUI
     try:

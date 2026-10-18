@@ -81,7 +81,9 @@ def run_tests():
     # 3. Piper Amy TTS Test
     print("\n[TEST 3] Piper TTS (Amy Voice)")
     tts = PiperTTS()
-    print(f"  TTS Engine: {tts.engine_type} (Amy ONNX exists: {tts.onnx_path.exists() if tts.onnx_path else False})")
+    active_prof = tts.available_voices.get(tts.active_voice_id)
+    onnx_exists = active_prof.onnx_path.exists() if active_prof and active_prof.onnx_path else False
+    print(f"  TTS Engine: {tts.engine_type} (Voice: {tts.active_voice_id}, Model exists: {onnx_exists})")
     tts.speak("ADAM system online and ready.")
     time.sleep(2.0)
     print("  ✔ Piper TTS engine verified!")
@@ -90,9 +92,10 @@ def run_tests():
     print("\n[TEST 4] 3D Object Synthesis Engine")
     blender_ok = is_blender_available()
     print(f"  Blender Detected: {blender_ok}")
-    ok, out_path, msg = generate_3d_object("cube", "stl", size=1.0)
-    if ok and out_path and out_path.exists():
-        print(f"  Generated 3D Asset: {out_path} ({out_path.stat().st_size} bytes)")
+    ok, asset, msg = generate_3d_object("cube", style="standard", size=1.0)
+    asset_path = getattr(asset, "glb_path", None) if asset else None
+    if ok and asset_path and asset_path.exists():
+        print(f"  Generated 3D Asset: {asset_path} ({asset_path.stat().st_size} bytes)")
         print("  ✔ 3D mesh synthesis test PASSED!")
     else:
         print(f"  ✖ 3D generation FAILED: {msg}")

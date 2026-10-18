@@ -1,0 +1,2 @@
+# Optional: install in the same environment as ADAM to enable local camera detection.
+opencv-python-headless>=4.10.0

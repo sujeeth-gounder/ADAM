@@ -37,14 +37,23 @@ backups/
 # Large AI Model weights (downloaded via scripts/download_models.py)
 models/piper/*.onnx
 ADAM_PORTABLE/models/piper/*.onnx
+models/vision/*.onnx
+voices/*.onnx
 
 # 3D Exports & generated audio/media
 exports/*.stl
 exports/*.obj
+exports/*.wav
+exports/generated_models/
 ADAM_PORTABLE/exports/*.stl
 ADAM_PORTABLE/exports/*.obj
+ADAM_PORTABLE/exports/generated_models/
 data/audio/*.wav
 data/audio/*.mp3
+data/adam.db*
+data/vision_settings.json
+data/client_secret.json
+data/gmail_token.json
 
 # OS / Editor files
 .DS_Store

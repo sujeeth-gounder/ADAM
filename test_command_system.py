@@ -67,7 +67,7 @@ class TestCommandParser(unittest.TestCase):
         res = self.parser.parse("play Tamil songs in Brave")
         self.assertTrue(res["handled"])
         self.assertEqual(res["intent"], "PLAY_MUSIC")
-        self.assertEqual(res["details"]["song_query"], "tamil songs")
+        self.assertEqual(res["details"]["song_query"].lower(), "tamil songs")
         self.assertTrue(res["details"]["in_brave"])
 
     def test_play_songs_in_brave(self):

@@ -687,43 +687,138 @@ class AppRegistry:
 
         return False, f"Application '{query_target}' was not found installed on this system."
 
-    def _try_spawn_candidate(self, candidate: str) -> Tuple[bool, str]:
-        """Spawn a binary, flatpak, or absolute path."""
+    def _find_windows_app(self, candidate: str) -> Optional[str]:
+        r"""
+        Locate executable on Windows using:
+        1. Explicit path existence
+        2. PATH lookup (shutil.which)
+        3. App Paths Registry (HKLM & HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths)
+        4. Standard Windows Install Directories (Program Files, LocalAppData, Start Menu)
+        """
+        if self.os_type != "windows":
+            return None
+
+        # 1. Direct or PATH
+        if os.path.isabs(candidate) and os.path.exists(candidate):
+            return candidate
+        which_path = shutil.which(candidate)
+        if which_path:
+            return which_path
+
+        # 2. Windows Registry lookup
         try:
-            # 1. Flatpak runner
+            import winreg
+            base_keys = [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]
+            subkeys = [
+                rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{candidate}",
+                rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{candidate}.exe"
+            ]
+            for bk in base_keys:
+                for sk in subkeys:
+                    try:
+                        with winreg.OpenKey(bk, sk) as key:
+                            val, _ = winreg.QueryValueEx(key, "")
+                            if val and os.path.exists(val):
+                                return val
+                    except Exception:
+                        pass
+        except ImportError:
+            pass
+
+        # 3. Known Common Install Locations
+        prog_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        prog_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        local_appdata = os.environ.get("LOCALAPPDATA", "")
+        roaming_appdata = os.environ.get("APPDATA", "")
+
+        common_search = [
+            # WhatsApp
+            os.path.join(local_appdata, r"WhatsApp\WhatsApp.exe"),
+            os.path.join(prog_files, r"WhatsApp\WhatsApp.exe"),
+            # Chrome / Brave
+            os.path.join(prog_files, r"Google\Chrome\Application\chrome.exe"),
+            os.path.join(prog_files_x86, r"Google\Chrome\Application\chrome.exe"),
+            os.path.join(prog_files, r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+            os.path.join(prog_files_x86, r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+            os.path.join(local_appdata, r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+            # Spotify
+            os.path.join(roaming_appdata, r"Spotify\Spotify.exe"),
+            # VS Code
+            os.path.join(local_appdata, r"Programs\Microsoft VS Code\Code.exe"),
+            os.path.join(prog_files, r"Microsoft VS Code\Code.exe"),
+            # Blender
+            os.path.join(prog_files, r"Blender Foundation\Blender\blender.exe"),
+        ]
+
+        cand_lower = candidate.lower()
+        for p in common_search:
+            if p and os.path.exists(p) and (cand_lower in p.lower() or Path(p).name.lower() == cand_lower):
+                return p
+
+        return None
+
+    def _try_spawn_candidate(self, candidate: str) -> Tuple[bool, str]:
+        """Spawn a binary, flatpak, UWP URI, or absolute path without unsafe shell string execution."""
+        try:
+            # 1. Windows UWP / Protocol scheme (e.g. 'start ms-settings:', 'calc.exe', 'explorer.exe')
+            if self.os_type == "windows":
+                # Check for ms-windows-store or protocol
+                if candidate.startswith("ms-") or ":" in candidate and not os.path.exists(candidate):
+                    # Clean and run via os.startfile for Windows protocol handlers
+                    try:
+                        clean_proto = candidate.replace("start ", "").strip()
+                        os.startfile(clean_proto)
+                        return True, clean_proto
+                    except Exception as ex:
+                        logger.debug(f"Protocol launch '{candidate}' failed: {ex}")
+
+                # Windows native utilities
+                win_system_tools = {
+                    "explorer.exe": ["explorer.exe"],
+                    "calc.exe": ["calc.exe"],
+                    "notepad.exe": ["notepad.exe"],
+                    "wt.exe": ["wt.exe"],
+                    "powershell.exe": ["powershell.exe"],
+                    "cmd.exe": ["cmd.exe"],
+                    "control": ["control"],
+                }
+                if candidate in win_system_tools:
+                    subprocess.Popen(win_system_tools[candidate], shell=False)
+                    return True, candidate
+
+                # Windows binary search
+                win_exe = self._find_windows_app(candidate)
+                if win_exe:
+                    subprocess.Popen([win_exe], shell=False)
+                    return True, win_exe
+
+            # 2. Linux Flatpak runner
             if candidate.startswith("flatpak:"):
                 app_id = candidate.split(":", 1)[1]
                 if shutil.which("flatpak"):
-                    # Check if installed
                     chk = subprocess.run(["flatpak", "info", app_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     if chk.returncode == 0:
                         subprocess.Popen(["flatpak", "run", app_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
                         return True, f"flatpak run {app_id}"
                 return False, "Flatpak app not installed"
 
-            # 2. Absolute or explicit path
+            # 3. macOS App Bundle or Path
+            if self.os_type == "darwin":
+                if candidate.endswith(".app") and os.path.exists(candidate):
+                    subprocess.Popen(["open", candidate], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return True, candidate
+
+            # 4. Absolute or explicit path
             if "/" in candidate or "\\" in candidate:
                 if os.path.exists(candidate):
-                    if self.os_type == "darwin" and candidate.endswith(".app"):
-                        subprocess.Popen(["open", candidate], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        return True, candidate
-                    elif os.access(candidate, os.X_OK):
-                        subprocess.Popen([candidate], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                    if os.access(candidate, os.X_OK) or self.os_type == "windows":
+                        subprocess.Popen([candidate], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=(self.os_type != "windows"))
                         return True, candidate
 
-            # 3. Windows Shell Run
-            if self.os_type == "windows":
-                if candidate.startswith("start "):
-                    subprocess.Popen(candidate, shell=True)
-                    return True, candidate
-                if shutil.which(candidate):
-                    subprocess.Popen([candidate], shell=True)
-                    return True, candidate
-
-            # 4. Standard PATH binary
+            # 5. Standard PATH binary
             bin_path = shutil.which(candidate)
             if bin_path:
-                subprocess.Popen([bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                subprocess.Popen([bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=(self.os_type != "windows"))
                 return True, bin_path
 
         except Exception as e:
@@ -867,32 +962,39 @@ class AppRegistry:
         url = f"https://www.google.com/search?q={encoded}"
         return self.open_url(url, force_brave=True)
 
-    def play_music(self, song_query: str, in_brave: bool = False) -> Tuple[bool, str]:
+    def resolve_first_youtube_video(self, search_query: str) -> Optional[Tuple[str, str]]:
         """
-        Play songs or artist music via YouTube search in Brave or default browser.
-        Never downloads copyrighted files; routes to legitimate streaming search.
+        Attempt to scrape YouTube search results page for the first video ID and title.
+        Returns (video_id, title) if found, else None.
         """
-        clean_target = song_query.strip()
-        # If user just said "play songs"
-        if not clean_target or clean_target.lower() in ["songs", "song", "music"]:
-            search_term = "trending songs playlist"
-            display_title = "popular music"
-        else:
-            # Ensure "songs" or "music" is part of the YouTube search query if not already
-            if not any(w in clean_target.lower() for w in ["song", "songs", "music", "track"]):
-                search_term = f"{clean_target} songs"
-            else:
-                search_term = clean_target
-            display_title = clean_target
+        try:
+            import urllib.request
+            encoded = urllib.parse.quote_plus(search_query)
+            url = f"https://www.youtube.com/results?search_query={encoded}"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+                
+            # Search for /watch?v=VIDEO_ID in the rendered JSON / HTML
+            matches = re.findall(r'\"videoId\":\"([a-zA-Z0-9_-]{11})\"', html)
+            if matches:
+                vid = matches[0]
+                return vid, search_query
+        except Exception as e:
+            logger.debug(f"Direct video lookup failed ({e}), falling back to search query.")
+        return None
 
-        encoded = urllib.parse.quote_plus(search_term)
-        url = f"https://www.youtube.com/results?search_query={encoded}"
-        
-        ok, msg = self.open_url(url, force_brave=in_brave)
-        browser = "Brave Browser" if (in_brave and self.find_brave_browser()) else "browser"
-        if ok:
-            return True, f"Playing {display_title} in {browser} via YouTube."
-        return False, f"Could not launch browser to play music: {msg}"
+    def play_music(self, song_query: str, in_brave: bool = False, force_service: Optional[str] = None) -> Tuple[bool, str]:
+        """
+        Play requested song using Spotify-First workflow with automatic YouTube direct playback fallback.
+        """
+        from app.music import MusicService
+        if not hasattr(self, "_music_service") or self._music_service is None:
+            self._music_service = MusicService(registry=self)
+        return self._music_service.play_song(song_query, force_service=force_service, force_brave=in_brave)
 
 
 # =============================================================================
@@ -922,6 +1024,7 @@ class CommandParser:
         raw = query.strip()
         # Clean leading/trailing punctuation and polite filler words
         cleaned = re.sub(r"^[\s,\.!\?]+|[\s,\.!\?]+$", "", raw)
+        cleaned = cleaned.replace("’", "'")
         cleaned = re.sub(r"^(?:please|could you please|can you please|could you|can you|hey adam|adam)\s+", "", cleaned, flags=re.IGNORECASE).strip()
         q_lower = cleaned.lower()
 
@@ -935,28 +1038,104 @@ class CommandParser:
                 "details": {}
             }
 
-        # 2. Time & Date Queries
-        if any(p in q_lower for p in ["what time is it", "current time", "what's the time", "tell me the time", "time please"]):
+        # 2. Time & Date Queries (Python system clock & zoneinfo, not Ollama)
+        # Check combined date & time
+        if "date and time" in q_lower or "time and date" in q_lower:
+            tz_m = re.search(r"(?:date\s+and\s+time|time\s+and\s+date)(?:\s+(?:in|for|at)\s+(.+))?$", q_lower)
+            tz_req = tz_m.group(1).strip() if tz_m and tz_m.group(1) else ""
+            tz_req = re.sub(r"\b(please|now|right now|though)\b", "", tz_req).strip()
             return {
                 "handled": True,
-                "intent": "GET_TIME",
-                "target": "",
+                "intent": "GET_TIME_AND_DATE",
+                "target": tz_req,
                 "force_brave": False,
-                "details": {}
+                "details": {"timezone": tz_req}
             }
 
-        if any(p in q_lower for p in ["what date is it", "today's date", "what is today's date", "what day is it", "today date"]):
-            return {
-                "handled": True,
-                "intent": "GET_DATE",
-                "target": "",
-                "force_brave": False,
-                "details": {}
-            }
+        # Explicit weekday questions return the local weekday, not a model-generated answer.
+        day_patterns = [
+            r"^what\s+day\s+is\s+(?:it\s+today|today|it)$",
+            r"^(?:tell\s+(?:me\s+)?|show\s+(?:me\s+)?)(?:the\s+)?day(?:\s+of\s+the\s+week)?(?:\s+today)?$",
+            r"^what\s+day\s+of\s+the\s+week\s+is\s+it(?:\s+today)?$",
+        ]
+        for pattern in day_patterns:
+            if re.search(pattern, q_lower):
+                return {
+                    "handled": True,
+                    "intent": "GET_DAY",
+                    "target": "",
+                    "force_brave": False,
+                    "details": {"timezone": ""},
+                }
+
+        # Check Date Queries
+        date_patterns = [
+            r"^(?:tell\s+(?:me\s+)?|show\s+(?:me\s+)?|what(?:'s|\s+is|\s+s)?\s+)?(?:the\s+)?(?:today(?:'s|\s+s)?\s+date|date\s+today|date)(?:\s+(?:in|for|at)\s+(.+))?$",
+            r"^what\s+date\s+is\s+it(?:\s+(?:in|for|at)\s+(.+))?$",
+            r"^what\s+day\s+is\s+(?:it|today)(?:\s+(?:in|for|at)\s+(.+))?$",
+            r"^(?:current\s+date)(?:\s+(?:in|for|at)\s+(.+))?$",
+            r"^date\s+please$",
+            r"^(?:tell\s+(?:me\s+)?|show\s+(?:me\s+)?)date$",
+            r"^today(?:'s)?\s+date$",
+        ]
+        for dp in date_patterns:
+            d_match = re.search(dp, q_lower)
+            if d_match:
+                tz_req = d_match.group(1).strip() if d_match.lastindex and d_match.group(1) else ""
+                tz_req = re.sub(r"\b(please|now|right now|though)\b", "", tz_req).strip()
+                return {
+                    "handled": True,
+                    "intent": "GET_DATE",
+                    "target": tz_req,
+                    "force_brave": False,
+                    "details": {"timezone": tz_req}
+                }
+
+        # Check Time Queries (e.g. 'Show the current Indian time', 'Indian time', 'tell me time in IST')
+        # 1. Adjective before time: 'indian time', 'ist time', 'show current indian time', 'tell me indian time'
+        adj_match = re.search(r"^(?:(?:tell|show|give)\s+(?:me\s+)?|(?:what(?:'s|\s+is)?\s+(?:the\s+)?))?(?:the\s+)?(?:current\s+)?([a-z\s]+?)\s+time(?:\s+(?:please|now|right now))?$", q_lower)
+        if adj_match:
+            cand = adj_match.group(1).strip()
+            cand_clean = re.sub(r"\b(current|local|the)\b", "", cand).strip()
+            if cand_clean in ("india", "indian", "ist", "isd", "utc", "gmt", "london", "tokyo", "new york", "california", "pacific", "eastern", "central"):
+                return {
+                    "handled": True,
+                    "intent": "GET_TIME",
+                    "target": cand_clean,
+                    "force_brave": False,
+                    "details": {"timezone": cand_clean}
+                }
+
+        # 2. General Time queries
+        time_patterns = [
+            r"^what(?:'s|\s+is)?\s+(?:the\s+)?time(?:\s+now)?$",
+            r"^(?:tell\s+(?:me\s+)?|show\s+(?:me\s+)?|give\s+(?:me\s+)?|what(?:'s|\s+is|\s+s)?\s+)?(?:the\s+)?(?:current\s+)?time(?:\s+(?:in|for|at)\s+(.+))?$",
+            r"^what\s+time\s+is\s+it(?:\s+(?:in|for|at)\s+(.+))?$",
+            r"^current\s+time(?:\s+(?:in|for|at)\s+(.+))?$",
+            r"^time\s+(?:in|for|at)\s+(.+)$",
+            r"^time\s+please$",
+            r"^what\s+is\s+the\s+time$",
+            r"^what\s+is\s+time$",
+            r"^time\s+now$",
+            r"^tell\s+(?:me\s+)?time$",
+            r"^show\s+(?:me\s+)?time$",
+        ]
+        for tp in time_patterns:
+            t_match = re.search(tp, q_lower)
+            if t_match:
+                tz_req = t_match.group(1).strip() if t_match.lastindex and t_match.group(1) else ""
+                tz_req = re.sub(r"\b(please|now|right now|though)\b", "", tz_req).strip()
+                return {
+                    "handled": True,
+                    "intent": "GET_TIME",
+                    "target": tz_req,
+                    "force_brave": False,
+                    "details": {"timezone": tz_req}
+                }
 
         # 3. Play Songs in Brave / Play songs
         # e.g., "play Tamil songs in Brave", "play songs in Brave", "play English songs", "play A.R. Rahman songs"
-        play_brave_match = re.search(r"^(?:play|listen to)\s+(.+?)\s+in\s+brave(?:\s+browser)?$", q_lower)
+        play_brave_match = re.search(r"^(?:play|listen to)\s+(.+?)\s+in\s+brave(?:\s+browser)?$", cleaned, re.IGNORECASE)
         if play_brave_match:
             song_spec = play_brave_match.group(1).strip()
             return {
@@ -977,25 +1156,34 @@ class CommandParser:
                 "details": {"song_query": "songs", "in_brave": True}
             }
 
-        # e.g., "play Tamil songs", "play English songs", "play despacito"
-        play_gen_match = re.search(r"^(?:play|listen to)\s+(.+)$", q_lower)
-        if play_gen_match and not q_lower.startswith("play on youtube"):
+        # e.g., "play Tamil songs", "play English songs", "play Vaadi Pulla Vaadi"
+        play_gen_match = re.search(r"^(?:play|listen to)\s+(.+)$", cleaned, re.IGNORECASE)
+        if play_gen_match:
             song_spec = play_gen_match.group(1).strip()
+            force_service = None
+            if re.search(r"\s+on\s+spotify\b", song_spec, re.IGNORECASE):
+                force_service = "spotify"
+                song_spec = re.sub(r"\s+on\s+spotify\b", "", song_spec, flags=re.IGNORECASE).strip()
+            elif re.search(r"\s+on\s+youtube\b", song_spec, re.IGNORECASE) or q_lower.startswith("play on youtube"):
+                force_service = "youtube"
+                song_spec = re.sub(r"\s+on\s+youtube\b", "", song_spec, flags=re.IGNORECASE).strip()
+
             # If specifies "in brave" at end
-            in_brave = "in brave" in song_spec
+            in_brave = bool(re.search(r"\s+in\s+brave.*$", song_spec, re.IGNORECASE))
             if in_brave:
-                song_spec = re.sub(r"\s+in\s+brave.*$", "", song_spec).strip()
+                song_spec = re.sub(r"\s+in\s+brave.*$", "", song_spec, flags=re.IGNORECASE).strip()
+
             return {
                 "handled": True,
                 "intent": "PLAY_MUSIC",
                 "target": song_spec,
                 "force_brave": in_brave,
-                "details": {"song_query": song_spec, "in_brave": in_brave}
+                "details": {"song_query": song_spec, "in_brave": in_brave, "force_service": force_service}
             }
 
         # 4. Search Brave for ...
         # e.g., "search Brave for machine learning"
-        brave_search_match = re.search(r"^(?:search\s+brave\s+for|search\s+in\s+brave\s+for|brave\s+search\s+for)\s+(.+)$", q_lower)
+        brave_search_match = re.search(r"^(?:search\s+brave\s+for|search\s+in\s+brave\s+for|brave\s+search\s+for)\s+(.+)$", cleaned, re.IGNORECASE)
         if brave_search_match:
             search_query = brave_search_match.group(1).strip()
             return {
@@ -1008,12 +1196,12 @@ class CommandParser:
 
         # 5. Search YouTube for ...
         # e.g., "search YouTube for Python tutorials", "search on youtube for ..."
-        yt_search_match = re.search(r"^(?:search\s+youtube\s+for|search\s+on\s+youtube\s+for|youtube\s+search\s+for|play\s+on\s+youtube)\s+(.+)$", q_lower)
+        yt_search_match = re.search(r"^(?:search\s+youtube\s+for|search\s+on\s+youtube\s+for|youtube\s+search\s+for|play\s+on\s+youtube)\s+(.+)$", cleaned, re.IGNORECASE)
         if yt_search_match:
             search_query = yt_search_match.group(1).strip()
-            in_brave = "in brave" in search_query
+            in_brave = bool(re.search(r"\s+in\s+brave.*$", search_query, re.IGNORECASE))
             if in_brave:
-                search_query = re.sub(r"\s+in\s+brave.*$", "", search_query).strip()
+                search_query = re.sub(r"\s+in\s+brave.*$", "", search_query, flags=re.IGNORECASE).strip()
             return {
                 "handled": True,
                 "intent": "YOUTUBE_SEARCH",

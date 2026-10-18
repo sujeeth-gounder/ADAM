@@ -1,19 +1,35 @@
 """Voice Synthesis (TTS) Module for ADAM.
-Integrates Piper TTS using the Amy English voice (en_US-amy-medium).
-Provides threaded queue, non-blocking audio playback, visualizer hooks, and graceful fallbacks.
+Supports multiple Piper TTS voices (Amy, Lessac, Ryan, Alba, etc.), pyttsx3,
+and system speech engines with dynamic voice switching, speed/volume control,
+voice previews, and persistence.
 """
 
+import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Dict, List, Optional, Tuple
+
+# Ensure local venv site-packages is accessible
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+_VENV_CANDIDATES = [
+    _ROOT_DIR / "venv",
+    _ROOT_DIR.parent / "venv",
+]
+for venv_root in _VENV_CANDIDATES:
+    if venv_root.exists():
+        for sp in venv_root.glob("lib*/python*/site-packages"):
+            if sp.exists() and str(sp) not in sys.path:
+                sys.path.insert(0, str(sp))
 
 from app.config import (
     PIPER_CONFIG_PATH,
@@ -24,8 +40,71 @@ from app.config import (
 logger = logging.getLogger("ADAM.Voice")
 
 
+def clean_text_for_speech(text: str) -> str:
+    """
+    Sanitize raw responses (removing URLs, markdown, emojis, asterisks)
+    so neural Piper TTS synthesizes immediately without multi-minute hangs or phonetic stalling.
+    """
+    if not text:
+        return ""
+    t = text.strip()
+
+    # 1. Remove URLs (e.g. https://youtu.be/... or http://...)
+    t = re.sub(r"https?://\S+", "", t)
+
+    # 2. Markdown links: [Link text](url) -> Link text
+    t = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", t)
+
+    # 3. Markdown styling (*, **, `, #)
+    t = re.sub(r"\*\*([^\*]+)\*\*", r"\1", t)
+    t = re.sub(r"\*([^\*]+)\*", r"\1", t)
+    t = re.sub(r"`([^`]+)`", r"\1", t)
+    t = re.sub(r"#+\s*", "", t)
+
+    # 4. Remove emojis and unusual symbols (range: \U00010000 to \U0010ffff)
+    t = re.sub(r"[\U00010000-\U0010ffff]", "", t)
+    t = re.sub(r"[^\w\s\.,!\?:;'\"]", " ", t)
+
+    # 5. Remove empty parentheses / brackets leftover from URL removal
+    t = re.sub(r"\(\s*\)", "", t)
+    t = re.sub(r"\[\s*\]", "", t)
+
+    # 6. Normalize whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # 7. For lengthy responses (> 350 chars), speak the primary 2-3 sentences for fast conversational response
+    if len(t) > 350:
+        sentences = re.split(r"(?<=[.!?])\s+", t)
+        shortened = ""
+        for s in sentences:
+            if len(shortened) + len(s) < 320:
+                shortened += (" " if shortened else "") + s
+            else:
+                break
+        t = shortened or sentences[0]
+
+    return t.strip()
+
+
+@dataclass
+class VoiceProfile:
+    """Represents a TTS voice available for selection."""
+    id: str
+    name: str
+    provider: str         # 'piper', 'pyttsx3', 'system'
+    onnx_path: Optional[Path] = None
+    config_path: Optional[Path] = None
+    pyttsx3_id: Optional[str] = None
+    language: str = "en"
+    gender: str = "female"
+    description: str = ""
+
+
 class PiperTTS:
-    """Piper TTS Engine targeting en_US-amy-medium voice."""
+    """
+    Advanced TTS Engine supporting Piper multi-voice models, speed/volume adjustments,
+    audio previews, and graceful system fallbacks.
+    """
 
     def __init__(
         self,
@@ -34,8 +113,6 @@ class PiperTTS:
         on_start: Optional[Callable[[], None]] = None,
         on_finish: Optional[Callable[[], None]] = None,
     ):
-        self.onnx_path = onnx_path or PIPER_ONNX_PATH
-        self.config_path = config_path or PIPER_CONFIG_PATH
         self.on_start = on_start
         self.on_finish = on_finish
 
@@ -45,68 +122,219 @@ class PiperTTS:
         self._current_process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
 
-        # Engine mode: 'piper_bin', 'piper_py', 'pyttsx3', 'espeak', or 'dummy'
+        # Config directory & persistence
+        self.data_dir = _ROOT_DIR / "data"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.voice_settings_file = self.data_dir / "voice_settings.json"
+
+        # Speech rate & volume settings
+        self.speed: float = 1.0       # 0.5 to 2.0 (Piper length_scale: inverse)
+        self.volume: float = 1.0      # 0.1 to 2.0
+
+        # Discovered voice profiles
+        self.available_voices: Dict[str, VoiceProfile] = {}
+        self.active_voice_id: str = "piper:en_US-amy-medium"
+
+        # Find Piper executable
+        self.piper_bin = self._find_piper_binary()
+
+        # Discover all voices and load saved preferences
+        self.refresh_voices(default_onnx=onnx_path, default_config=config_path)
+        self._load_saved_settings()
+
+        # Engine mode: 'piper_bin', 'piper_py', 'pyttsx3', 'system_speech', or 'dummy'
         self.engine_type = "dummy"
-        self._init_engine()
+        self._evaluate_engine()
 
         # Start playback worker thread
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker_thread.start()
 
-    def _init_engine(self):
-        """Determine the best available TTS backend."""
-        # 1. Check for piper CLI binary
-        if shutil.which("piper") and self.onnx_path.exists():
-            self.engine_type = "piper_bin"
-            logger.info("Initialized Piper TTS via CLI binary.")
-            return
+    def _find_piper_binary(self) -> Optional[str]:
+        """Locate piper CLI in system PATH or ADAM virtual environment."""
+        # 1. System PATH
+        which_path = shutil.which("piper")
+        if which_path:
+            return which_path
 
-        # 2. Check for python piper package
-        try:
-            import piper  # noqa: F401
-            if self.onnx_path.exists():
-                self.engine_type = "piper_py"
-                logger.info("Initialized Piper TTS via python library.")
-                return
-        except ImportError:
-            pass
+        # 2. Local venv
+        venv_candidates = [
+            _ROOT_DIR / "venv" / "bin" / "piper",
+            _ROOT_DIR / "venv" / "Scripts" / "piper.exe",
+            _ROOT_DIR.parent / "venv" / "bin" / "piper",
+        ]
+        for vc in venv_candidates:
+            if vc.exists() and os.access(vc, os.X_OK):
+                return str(vc)
 
-        # 3. Check for pyttsx3 fallback
+        return None
+
+    def refresh_voices(self, default_onnx: Optional[Path] = None, default_config: Optional[Path] = None) -> List[VoiceProfile]:
+        """Scan all known voice directories for Piper .onnx models and pyttsx3 voices."""
+        self.available_voices.clear()
+
+        # Known search paths for Piper voices
+        search_dirs = [
+            _ROOT_DIR / "voices",
+            _ROOT_DIR / "models" / "piper",
+            _ROOT_DIR / "models",
+            Path.home() / "ADAM" / "voices",
+            Path.home() / ".local" / "share" / "piper" / "voices",
+        ]
+        if default_onnx and default_onnx.parent not in search_dirs:
+            search_dirs.insert(0, default_onnx.parent)
+
+        # 1. Scan Piper ONNX models
+        for sdir in search_dirs:
+            if sdir.exists():
+                for onnx in sdir.glob("*.onnx"):
+                    cfg = onnx.with_suffix(".onnx.json")
+                    if not cfg.exists():
+                        cfg = onnx.parent / f"{onnx.name}.json"
+
+                    voice_id = f"piper:{onnx.stem}"
+                    display_name = onnx.stem.replace("_", " ").replace("-", " ").title()
+                    
+                    profile = VoiceProfile(
+                        id=voice_id,
+                        name=f"Piper: {display_name}",
+                        provider="piper",
+                        onnx_path=onnx,
+                        config_path=cfg if cfg.exists() else None,
+                        language=onnx.stem.split("-")[0] if "-" in onnx.stem else "en",
+                        description=f"Neural ONNX model at {onnx.name}"
+                    )
+                    self.available_voices[voice_id] = profile
+
+        # Ensure Amy voice is explicitly registered if present
+        amy_onnx = default_onnx or PIPER_ONNX_PATH
+        amy_cfg = default_config or PIPER_CONFIG_PATH
+        if amy_onnx.exists() and "piper:en_US-amy-medium" not in self.available_voices:
+            self.available_voices["piper:en_US-amy-medium"] = VoiceProfile(
+                id="piper:en_US-amy-medium",
+                name="Piper: Amy (English Natural)",
+                provider="piper",
+                onnx_path=amy_onnx,
+                config_path=amy_cfg if amy_cfg.exists() else None,
+                language="en_US",
+                gender="female",
+                description="Clear, natural female English voice"
+            )
+
+        # 2. Scan pyttsx3 system voices
         try:
             import pyttsx3
-            # Test engine init
-            test_engine = pyttsx3.init()
-            test_engine.stop()
+            engine = pyttsx3.init()
+            sys_voices = engine.getProperty("voices") or []
+            for v in sys_voices:
+                # Include English / major voices
+                v_name = v.name or v.id
+                v_id = f"pyttsx3:{v.id}"
+                self.available_voices[v_id] = VoiceProfile(
+                    id=v_id,
+                    name=f"System: {v_name}",
+                    provider="pyttsx3",
+                    pyttsx3_id=v.id,
+                    description=f"System TTS voice ({v.id})"
+                )
+        except Exception as e:
+            logger.debug(f"pyttsx3 voice scanning notice: {e}")
+
+        # If no active voice selected, pick Amy or first available
+        if self.active_voice_id not in self.available_voices and self.available_voices:
+            if "piper:en_US-amy-medium" in self.available_voices:
+                self.active_voice_id = "piper:en_US-amy-medium"
+            else:
+                self.active_voice_id = list(self.available_voices.keys())[0]
+
+        return list(self.available_voices.values())
+
+    def _load_saved_settings(self):
+        """Load user-selected voice and speech parameters."""
+        if not self.voice_settings_file.exists():
+            return
+        try:
+            with open(self.voice_settings_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            saved_id = data.get("active_voice_id")
+            if saved_id and saved_id in self.available_voices:
+                self.active_voice_id = saved_id
+            self.speed = float(data.get("speed", 1.0))
+            self.volume = float(data.get("volume", 1.0))
+        except Exception as e:
+            logger.debug(f"Could not load voice settings: {e}")
+
+    def save_settings(self):
+        """Persist user-selected voice and speech parameters to disk."""
+        try:
+            data = {
+                "active_voice_id": self.active_voice_id,
+                "speed": self.speed,
+                "volume": self.volume
+            }
+            with open(self.voice_settings_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save voice settings: {e}")
+
+    def set_voice(self, voice_id: str) -> bool:
+        """Switch active voice profile."""
+        if voice_id in self.available_voices:
+            self.active_voice_id = voice_id
+            self.save_settings()
+            self._evaluate_engine()
+            logger.info(f"Switched active voice to: {voice_id}")
+            return True
+        return False
+
+    def set_speed(self, speed: float):
+        """Set voice speed factor (0.5 = slow, 1.0 = normal, 1.5 = fast)."""
+        self.speed = max(0.5, min(2.0, speed))
+        self.save_settings()
+
+    def set_volume(self, volume: float):
+        """Set voice volume factor (0.0 to 1.5)."""
+        self.volume = max(0.0, min(1.5, volume))
+        self.save_settings()
+
+    def _evaluate_engine(self):
+        """Determine active engine type for current profile."""
+        prof = self.available_voices.get(self.active_voice_id)
+        if prof and prof.provider == "piper" and prof.onnx_path and prof.onnx_path.exists():
+            if self.piper_bin:
+                self.engine_type = "piper_bin"
+                return
+            try:
+                import piper  # noqa: F401
+                self.engine_type = "piper_py"
+                return
+            except ImportError:
+                pass
+
+        if prof and prof.provider == "pyttsx3":
             self.engine_type = "pyttsx3"
-            logger.info("Fallback: Initialized pyttsx3 TTS.")
+            return
+
+        # Fallbacks
+        try:
+            import pyttsx3
+            self.engine_type = "pyttsx3"
             return
         except Exception:
             pass
 
-        # 4. Check for system espeak / espeak-ng / spd-say
-        if shutil.which("espeak-ng") or shutil.which("espeak") or shutil.which("spd-say"):
+        if shutil.which("spd-say") or shutil.which("espeak-ng") or shutil.which("espeak"):
             self.engine_type = "system_speech"
-            logger.info("Fallback: Initialized system speech (espeak/spd-say).")
             return
 
-        # 5. Fallback dummy
         self.engine_type = "dummy"
-        logger.warning("No audio TTS engine available. Speech will log to terminal.")
-
-    def has_amy_voice_model(self) -> bool:
-        """Check if Amy ONNX model files are downloaded locally."""
-        return self.onnx_path.exists() and self.config_path.exists()
 
     def get_status_info(self) -> str:
-        """Return human-readable status for UI badges."""
-        if self.has_amy_voice_model():
-            return f"Piper TTS (Amy Voice) [{self.engine_type}]"
-        elif self.engine_type == "pyttsx3":
-            return "TTS (pyttsx3 fallback - Download Amy voice)"
-        elif self.engine_type == "system_speech":
-            return "TTS (System Speech fallback)"
-        else:
-            return "TTS (Silent / Voice model pending)"
+        """Return human-readable status for UI badge."""
+        prof = self.available_voices.get(self.active_voice_id)
+        if prof:
+            return f"Voice: {prof.name} [{self.engine_type}]"
+        return f"Voice: [{self.engine_type}]"
 
     def is_speaking(self) -> bool:
         return self._is_speaking
@@ -122,11 +350,14 @@ class PiperTTS:
 
         self._queue.put(clean_text)
 
+    def preview_voice(self, text: str = "Hello! I am ADAM, your desktop AI companion."):
+        """Play immediate voice preview."""
+        self.speak(text, interrupt=True)
+
     def stop(self):
         """Immediately stop speaking and clear remaining queue."""
         self._stop_requested = True
         with self._lock:
-            # Drain queue
             while not self._queue.empty():
                 try:
                     self._queue.get_nowait()
@@ -134,7 +365,6 @@ class PiperTTS:
                 except queue.Empty:
                     break
 
-            # Terminate active process if playing
             if self._current_process and self._current_process.poll() is None:
                 try:
                     self._current_process.terminate()
@@ -176,62 +406,61 @@ class PiperTTS:
                         logger.debug(f"on_finish callback error: {e}")
 
     def _synthesize_and_play(self, text: str):
-        """Synthesize and play audio based on active engine."""
-        # Check if Amy model has been downloaded dynamically
-        if self.engine_type in ["dummy", "pyttsx3", "system_speech"] and self.has_amy_voice_model():
-            if shutil.which("piper"):
-                self.engine_type = "piper_bin"
-            else:
-                try:
-                    import piper  # noqa: F401
-                    self.engine_type = "piper_py"
-                except ImportError:
-                    pass
+        """Synthesize and play audio with active profile."""
+        prof = self.available_voices.get(self.active_voice_id)
 
-        # 1. Try Piper binary if model exists
-        if self.engine_type == "piper_bin" and self.onnx_path.exists():
-            if self._speak_with_piper_bin(text):
-                return
+        # 1. Try Piper binary if piper voice
+        if prof and prof.provider == "piper" and prof.onnx_path and prof.onnx_path.exists():
+            if self.piper_bin:
+                if self._speak_with_piper_bin(text, prof):
+                    return
 
         # 2. Try Piper Python API
-        if self.engine_type == "piper_py" and self.onnx_path.exists():
-            if self._speak_with_piper_py(text):
+        if prof and prof.provider == "piper" and prof.onnx_path and prof.onnx_path.exists():
+            if self._speak_with_piper_py(text, prof):
                 return
 
-        # 3. Fallback: pyttsx3
-        if self.engine_type == "pyttsx3":
-            if self._speak_with_pyttsx3(text):
-                return
+        # 3. Try pyttsx3
+        if self._speak_with_pyttsx3(text, prof):
+            return
 
-        # 4. Fallback: system speech
-        if self.engine_type == "system_speech":
-            if self._speak_with_system_speech(text):
-                return
+        # 4. Fallback system speech
+        if self._speak_with_system_speech(text):
+            return
 
-        # 5. Last resort: log to stdout
         logger.info(f"[ADAM Spoke]: {text}")
 
-    def _speak_with_piper_bin(self, text: str) -> bool:
-        """Synthesize with piper binary and play with paplay/aplay."""
+    def _speak_with_piper_bin(self, text: str, prof: VoiceProfile) -> bool:
+        """Synthesize using piper CLI with length-scale (speed) and volume."""
+        speech_text = clean_text_for_speech(text)
+        if not speech_text:
+            return True
+
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
             tmp_wav_path = Path(tmp_wav.name)
 
         try:
-            piper_cmd = [
-                "piper",
-                "--model", str(self.onnx_path),
-                "--config", str(self.config_path),
-                "--output_file", str(tmp_wav_path)
+            # Piper speed uses length-scale: higher = slower, lower = faster
+            length_scale = 1.0 / max(0.5, self.speed)
+            
+            cmd = [
+                self.piper_bin or "piper",
+                "--model", str(prof.onnx_path),
+                "--output_file", str(tmp_wav_path),
+                "--length-scale", f"{length_scale:.2f}",
+                "--volume", f"{self.volume:.2f}"
             ]
+            if prof.config_path and prof.config_path.exists():
+                cmd.extend(["--config", str(prof.config_path)])
 
             proc = subprocess.Popen(
-                piper_cmd,
+                cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True
             )
-            _, err = proc.communicate(input=text, timeout=20)
+            _, err = proc.communicate(input=speech_text, timeout=45)
             if proc.returncode != 0 or not tmp_wav_path.exists() or tmp_wav_path.stat().st_size == 0:
                 logger.error(f"Piper binary error: {err}")
                 return False
@@ -239,10 +468,9 @@ class PiperTTS:
             if self._stop_requested:
                 return True
 
-            # Play WAV
             return self._play_wav_file(tmp_wav_path)
         except Exception as e:
-            logger.error(f"Piper binary execution error: {e}")
+            logger.error(f"Piper execution error: {e}")
             return False
         finally:
             if tmp_wav_path.exists():
@@ -251,8 +479,12 @@ class PiperTTS:
                 except Exception:
                     pass
 
-    def _speak_with_piper_py(self, text: str) -> bool:
-        """Synthesize using Python piper library."""
+    def _speak_with_piper_py(self, text: str, prof: VoiceProfile) -> bool:
+        """Synthesize using piper python library."""
+        speech_text = clean_text_for_speech(text)
+        if not speech_text:
+            return True
+
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
             tmp_wav_path = Path(tmp_wav.name)
 
@@ -260,9 +492,10 @@ class PiperTTS:
             import wave
             from piper import PiperVoice
 
-            voice = PiperVoice.load(str(self.onnx_path), config_path=str(self.config_path))
+            cfg_arg = str(prof.config_path) if prof.config_path and prof.config_path.exists() else None
+            voice = PiperVoice.load(str(prof.onnx_path), config_path=cfg_arg)
             with wave.open(str(tmp_wav_path), "wb") as wav_file:
-                voice.synthesize_wav(text, wav_file)
+                voice.synthesize_wav(speech_text, wav_file)
 
             if self._stop_requested:
                 return True
@@ -279,15 +512,25 @@ class PiperTTS:
                     pass
 
     def _play_wav_file(self, wav_path: Path) -> bool:
-        """Play a WAV file using system sound tools (paplay, aplay, sounddevice)."""
-        # Determine player
+        """Play a WAV file using winsound (Windows), pw-play, paplay, aplay, play, or sounddevice."""
+        if sys.platform == "win32":
+            try:
+                import winsound
+                with self._lock:
+                    if self._stop_requested:
+                        return True
+                winsound.PlaySound(str(wav_path), winsound.SND_FILENAME)
+                return True
+            except Exception as e:
+                logger.debug(f"winsound playback failed: {e}")
+
         player_cmd = None
-        if shutil.which("paplay"):
+        if shutil.which("pw-play"):
+            player_cmd = ["pw-play", str(wav_path)]
+        elif shutil.which("paplay"):
             player_cmd = ["paplay", str(wav_path)]
         elif shutil.which("aplay"):
             player_cmd = ["aplay", "-q", str(wav_path)]
-        elif shutil.which("pw-play"):
-            player_cmd = ["pw-play", str(wav_path)]
         elif shutil.which("play"):
             player_cmd = ["play", "-q", str(wav_path)]
 
@@ -305,48 +548,72 @@ class PiperTTS:
                 self._current_process = None
             return True
 
-        # Fallback to sounddevice / soundfile in python if installed
+        # Fallback to sounddevice
         try:
             import sounddevice as sd
             import soundfile as sf
             data, fs = sf.read(str(wav_path))
-            sd.play(data, fs)
+            sd.play(data * self.volume, fs)
             sd.wait()
             return True
         except Exception as e:
             logger.debug(f"sounddevice playback failed: {e}")
             return False
 
-    def _speak_with_pyttsx3(self, text: str) -> bool:
+    def _speak_with_pyttsx3(self, text: str, prof: Optional[VoiceProfile] = None) -> bool:
         """Fallback to pyttsx3."""
         try:
             import pyttsx3
             engine = pyttsx3.init()
-            # Set speech rate & volume
-            engine.setProperty("rate", 175)
-            engine.setProperty("volume", 0.95)
-            # Find female English voice if available
-            voices = engine.getProperty("voices")
-            for v in voices:
-                if "english" in v.name.lower() or "en" in v.id.lower():
-                    if "female" in v.name.lower() or "zira" in v.name.lower() or "amy" in v.name.lower():
+            # Speed & volume
+            rate = int(175 * self.speed)
+            engine.setProperty("rate", rate)
+            engine.setProperty("volume", min(1.0, self.volume))
+
+            if prof and prof.pyttsx3_id:
+                engine.setProperty("voice", prof.pyttsx3_id)
+            else:
+                voices = engine.getProperty("voices") or []
+                for v in voices:
+                    if "en" in (v.id or "").lower() or "english" in (v.name or "").lower():
                         engine.setProperty("voice", v.id)
                         break
+
             engine.say(text)
             engine.runAndWait()
             return True
         except Exception as e:
-            logger.error(f"pyttsx3 error: {e}")
+            logger.debug(f"pyttsx3 synthesis error: {e}")
             return False
 
     def _speak_with_system_speech(self, text: str) -> bool:
-        """Fallback to system espeak or spd-say."""
+        """Fallback to system spd-say / espeak / Windows SAPI."""
+        if sys.platform == "win32":
+            try:
+                escaped = text.replace("'", "''")
+                ps_script = f"Add-Type -AssemblyName System.Speech; $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; $synth.Speak('{escaped}')"
+                cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script]
+                with self._lock:
+                    if self._stop_requested:
+                        return True
+                    self._current_process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                self._current_process.wait()
+                with self._lock:
+                    self._current_process = None
+                return True
+            except Exception:
+                return False
+
         if shutil.which("spd-say"):
-            cmd = ["spd-say", "-t", "female1", "-r", "10", text]
+            cmd = ["spd-say", "-t", "female1", "-r", str(int(self.speed * 10)), text]
         elif shutil.which("espeak-ng"):
-            cmd = ["espeak-ng", "-v", "en-us+f3", "-s", "160", text]
+            cmd = ["espeak-ng", "-v", "en-us+f3", "-s", str(int(160 * self.speed)), text]
         elif shutil.which("espeak"):
-            cmd = ["espeak", "-v", "en+f3", "-s", "160", text]
+            cmd = ["espeak", "-v", "en+f3", "-s", str(int(160 * self.speed)), text]
         else:
             return False
 
